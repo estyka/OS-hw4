@@ -1,10 +1,11 @@
 #include <stdio.h> // for printf, fprintf, stderr
 #include <stdlib.h>
-#include <thread.h>
+#include <threads.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 
 
 #define FAIL 1
@@ -12,6 +13,17 @@
 
 // TODO: need to validate all mutex functions (init, lock, unlock)
 // TODO: add path array to dir_queue with max_length - to be able to add dirname, but hold absolute path
+typedef struct node node;
+typedef struct queue queue;
+void enqueue(queue* _queue, char* _data);
+char* dequeue(queue* _queue);
+void handle_dir(char* dir_path_entry);
+void handle_file(char* file_path_entry, char* filename);
+int search_dir(char* dirname);
+void* thread_run();
+int main(int argc, char **argv);
+
+
 
 //============================== Initializations
 queue* dir_queue;
@@ -24,6 +36,7 @@ int seach_files_counter;
 // locks and cvs - need to initialize
 
 mtx_t qlock; // for accessing num_threads_waiting and dir_queue
+mtx_t start_lock;
 cnd_t notEmpty;
 
 mtx_t threads_counter_lock; // for accessing threads_error, threads_alive_counter
@@ -60,7 +73,7 @@ void enqueue(queue* _queue, char* _data) {
     return;
 }
 
-node* dequeue(queue* _queue) {
+char* dequeue(queue* _queue) {
     // assert that dequeue was called when no empty?
     if (_queue->front == NULL) {
         return NULL; // raise exception?
@@ -84,7 +97,7 @@ node* dequeue(queue* _queue) {
 
 
 //==================================================== Thread functions
-void handle_dir(dir_path_entry) {
+void handle_dir(char* dir_path_entry) {
     // check if dp_entry can be searched
     DIR* dir_entry_pointer;
     if ( (dir_entry_pointer=opendir(dir_path_entry)) ) { // enqueue
@@ -99,19 +112,19 @@ void handle_dir(dir_path_entry) {
     return;
 }
 
-void handle_file(path_entry, filename) {
+void handle_file(char* file_path_entry, char*filename) {
     char* ret = strstr(filename, TERM);
     if (ret != NULL) {
         mtx_lock(&search_files_counter_lock);
         seach_files_counter ++;
         mtx_unlock(&search_files_counter_lock);
-        printf("%s/%s\n", path_entry);
+        printf("%s\n", file_path_entry);
     }
 }
 
 
 // Assumption dirname holds the full path to this dir (from root)
-int search_dir(dirname) {
+int search_dir(char* dirname) {
     // char path_entry[PATH_MAX];  // defined in <limits.h>
     DIR* dir_pointer;
     struct dirent *entry;
@@ -124,12 +137,13 @@ int search_dir(dirname) {
         return FAIL;
     }
     while ( (entry=readdir(dir_pointer)) ) {
-        if (entry->d_name == "." || entry->d_name == "..") {
+        if (strcmp(entry->d_name, ".")==0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
         path_entry = dirname; // to iterate parent dir to entry
         strcat(path_entry, "/");
         strcat(path_entry, entry->d_name);
+        printf("path_entry=%s\n", path_entry);
 
         if (lstat(path_entry, &stats) != 0) { // TODO: not sure if to use stat or lstat?
             fprintf(stderr, "ERROR: unable to get entry stats, errno: %s\n", strerror(errno));
@@ -150,12 +164,12 @@ int search_dir(dirname) {
 }
 
 
-void thread_run(){
+void* thread_run(){
     // FLOW:
 
     // 1: signal from main that all threads are created and ready to start searching == start_lock is available
-    rc = mtx_lock(&start_lock);
-    rc = mtx_unlock(&start_lock); // allow other threads to retrieve this lock so they can start searching too
+    mtx_lock(&start_lock);
+    mtx_unlock(&start_lock); // allow other threads to retrieve this lock so they can start searching too
 
     while(1) { // keep trying to dequeue and search until nothing left
         
@@ -172,7 +186,7 @@ void thread_run(){
                 cnd_signal(&notEmpty); // wake up another thread so it can also exit - all threads will eventually be woken up and get to this condition to exit // TODO: not sure if this should be cnd_broadcast?
                 mtx_unlock(&qlock); //unlock before exiting
 
-                thrd_exit(NULL); // all threads will get to this condition and exit
+                thrd_exit(SUCCESS); // all threads will get to this condition and exit
             }
             num_threads_waiting++; // before waiting - add myself to waiting list
             cnd_wait(&notEmpty,&qlock); // need to be woken up when notEmpty.
@@ -201,7 +215,7 @@ void thread_run(){
             mtx_unlock(&threads_counter_lock);
             mtx_unlock(&qlock);
 
-            thrd_exit(NULL);
+            thrd_exit(FAIL);
         }
     }
 
@@ -219,7 +233,7 @@ than 0)
 // TODO: make sure main finished in a case that all threads exited due to an error
 
 int main(int argc, char **argv) {
-    int rc;
+    // int rc;
     int status;
 
     if (argc != 4) {
@@ -230,7 +244,7 @@ int main(int argc, char **argv) {
     char* root_dir = argv[1]; // TODO: can I assume that this is a dir and not a file? Can I assume that this is not "." or ".."?
     TERM = argv[2]; // global variable
     int num_threads = atoi(argv[3]); // global variable
-    THREADS_ALIVE_COUNTER = num_threads;
+    threads_alive_counter = num_threads;
     thrd_t thread[num_threads];
 
     if (strcmp(root_dir, ".") == 0 || strcmp(root_dir, "..") == 0 || opendir(root_dir) == NULL){
@@ -249,7 +263,7 @@ int main(int argc, char **argv) {
     mtx_lock(&start_lock);
     for (long t = 0; t < num_threads; t++) {
         printf("Main: creating thread %ld\n", t);
-        if (thrd_create(&thread[t], thread_run, NULL) != thrd_success) {
+        if (thrd_create(&thread[t], (thrd_start_t) thread_run, NULL) != thrd_success) {
             fprintf(stderr, "ERROR in thrd_create(), errno: %s\n", strerror(errno));
             exit(FAIL);
         }
