@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <string.h>
+#include <limits.h>
 
 
 #define FAIL 1
@@ -15,14 +16,18 @@
 //============================== Initializations
 queue* dir_queue;
 int num_threads_waiting;
+int threads_error;
 char* TERM;
-int NUM_THREADS;
-// int thread_at_work;
+int threads_alive_counter; // I think qlock is good enough to make this variable atomic - only place it is written to is with qlock locked.
+int seach_files_counter;
 
 // locks and cvs - need to initialize
 
 mtx_t qlock; // for accessing num_threads_waiting and dir_queue
 cnd_t notEmpty;
+
+mtx_t threads_counter_lock; // for accessing threads_error, threads_alive_counter
+mtx_t search_files_counter_lock;
 
 // mtx_t working_thread_lock; // for modifying thread_at_work
 
@@ -79,33 +84,39 @@ node* dequeue(queue* _queue) {
 
 
 //==================================================== Thread functions
-void handle_dir(dir_entry) {
-    // check if 
+void handle_dir(dir_path_entry) {
+    // check if dp_entry can be searched
     DIR* dir_entry_pointer;
-    if ( (dir_entry_pointer=opendir(dir_entry)) ) { // enqueue
+    if ( (dir_entry_pointer=opendir(dir_path_entry)) ) { // enqueue
         mtx_lock(&qlock);
-        enqueue(dir_queue, dir_entry);
+        enqueue(dir_queue, dir_path_entry);
         cnd_signal(&notEmpty); // always needs to signal or only when queue was empty before adding?
         mtx_unlock(&qlock);
     }
-    else { // returned NULL - dir_entry can't be searched
-        printf("Directory %s: Permission denied.\n", dir_entry); // TODO: dir_entry needs to be full path!
+    else { // returned NULL - dir_path_entry can't be searched
+        printf("Directory %s: Permission denied.\n", dir_path_entry);
     }
     return;
 }
 
-void handle_folder(folder_entry) {
-    char* ret = strstr(folder_entry, TERM);
+void handle_file(path_entry, filename) {
+    char* ret = strstr(filename, TERM);
     if (ret != NULL) {
-        printf("%s\n", folder_entry); // TODO: folder_entry needs to be full path
+        mtx_lock(&search_files_counter_lock);
+        seach_files_counter ++;
+        mtx_unlock(&search_files_counter_lock);
+        printf("%s/%s\n", path_entry);
     }
 }
 
 
+// Assumption dirname holds the full path to this dir (from root)
 int search_dir(dirname) {
+    // char path_entry[PATH_MAX];  // defined in <limits.h>
     DIR* dir_pointer;
     struct dirent *entry;
     struct stat stats;
+    char* path_entry;
 
     dir_pointer = opendir(dirname);
     if (dir_pointer == NULL) {
@@ -116,15 +127,18 @@ int search_dir(dirname) {
         if (entry->d_name == "." || entry->d_name == "..") {
             continue;
         }
-        if (lstat(entry, &stats) != 0) { // TODO: not sure if to use stat or lstat?
+        path_entry = dirname; // to iterate parent dir to entry
+        strcat(path_entry, "/");
+        strcat(path_entry, entry->d_name);
+
+        if (lstat(path_entry, &stats) != 0) { // TODO: not sure if to use stat or lstat?
             fprintf(stderr, "ERROR: unable to get entry stats, errno: %s\n", strerror(errno));
         }
         if (S_ISDIR(stats.st_mode)) {
-            handle_dir(entry); // check if dir is searchable and if yes add to queue
+            handle_dir(path_entry); // check if dir is searchable and if yes add to queue
         }
         else {
-            // handle folder - check term
-            handle_folder(entry);
+            handle_file(path_entry, entry->d_name); // handle folder - check term
         }
     }
 
@@ -147,63 +161,54 @@ void thread_run(){
         
         // 2: dequeue
         mtx_lock(&qlock);  // Assumption: dir_queue (==dequeue action) and num_threads_waiting are atomic with qlock
-        while (dir_queue->front == NULL ) { // dir queue is empty - need to be woken up when notEmpty.
-            // check if no threads are waiting - dont want to be in cond_wait if there is no more potential work to do
-            if (num_threads_waiting == NUM_THREADS && thread_at_work == 0) { // no threads are waiting or working and nothing to search for - exit cleanly. //TODO: do i need to have a special lock for num_threads_waiting?
+        while (dir_queue->front == NULL ) { // dir queue is empty 
+            // check if all other threads are waiting - dont want to be in cond_wait if there is no more potential work to do
+            // Assumption: num_threads_waiting == threads_alive_counter-1 iff there are no threads currently working
+            if (num_threads_waiting == threads_alive_counter-1) { // TODO: not sure if num_threads_waiting could also be == THREADS_ALIVE_COUNTER
+                mtx_lock(&threads_counter_lock);
+                threads_alive_counter--;
+                mtx_unlock(&threads_counter_lock);
+
+                cnd_signal(&notEmpty); // wake up another thread so it can also exit - all threads will eventually be woken up and get to this condition to exit // TODO: not sure if this should be cnd_broadcast?
                 mtx_unlock(&qlock); //unlock before exiting
+
                 thrd_exit(NULL); // all threads will get to this condition and exit
-                // exit(SUCCESS);
             }
             num_threads_waiting++; // before waiting - add myself to waiting list
-            cnd_wait(&notEmpty,&qlock);
+            cnd_wait(&notEmpty,&qlock); // need to be woken up when notEmpty.
             num_threads_waiting--; // got woken up so removing itself from waiting list
         }
         char* dirname = dequeue(dir_queue);  // woken up and there is data in dir_queue - time to dequeue
-        // mtx_lock(&working_thread_lock);
-        // thread_at_work++ ;
-        // mtx_unlock(&working_thread_lock);
         mtx_unlock(&qlock);
         
         // 3: Search dir...
         int ret = search_dir(dirname);
-        
-        // mtx_lock(&working_thread_lock);
-        // thread_at_work--;
-        // mtx_unlock(&working_thread_lock);
-        
         if (ret != SUCCESS) {
+
+            mtx_lock(&threads_counter_lock);
+            threads_alive_counter--;
+            threads_error = 1;
+
+            // check if need to wake up another thread // if queue is empty but not all threads are waiting - it means that there are other threads working who can wake up other threads 
+            mtx_lock(&qlock);
+            if (dir_queue->front != NULL) { // if queue is not empty - wake up another thread to start searching
+                cnd_signal(&notEmpty);
+            }
+            else if (num_threads_waiting==threads_alive_counter-1) { // if no more potential work - wake up another thread to exit
+                cnd_signal(&notEmpty); 
+            }
+
+            mtx_unlock(&threads_counter_lock);
+            mtx_unlock(&qlock);
+
             thrd_exit(NULL);
         }
-         // only when thread finishes processing the info from queue it removes itself from waiting list
-                                // this is so that the queue and waiting list will be empty iff there are no threads working.
     }
 
 }
 
 
 //==================================================== Main Functions
-
-// def launch_threads(int num_threads) {
-
-//     // --- Create threads -----------------------------
-//     for (long t = 0; t < num_threads; t++) {
-//         printf("Main: creating thread %ld\n", t);
-//         if (thrd_create(&thread[t], thread_run, NULL) != thrd_success) {
-//             fprintf(stderr, "ERROR in thrd_create(), errno: %s\n", strerror(errno));
-//             exit(FAIL);
-//         }
-//     }
-
-//     // --- Wait for threads to finish ------------------
-//     for (long t = 0; t < num_threads; ++t) {
-//         if (thrd_join(thread[t], &status) != thrd_success) {  // &status is not optional - can also be NULL
-//             fprintf(stderr, "ERROR in thrd_join(), errno: %s\n", strerror(errno));
-//             exit(FAIL);
-//         }
-//         printf("Main: completed join with thread %ld having a status of %ld\n", t, (long)status);
-//     }
-// }
-
 /*
 • argv[1]: search root directory (search for files within this directory and its subdirectories).
 • argv[2]: search term (search for file names that include the search term).
@@ -224,7 +229,8 @@ int main(int argc, char **argv) {
 
     char* root_dir = argv[1]; // TODO: can I assume that this is a dir and not a file? Can I assume that this is not "." or ".."?
     TERM = argv[2]; // global variable
-    NUM_THREADS = atoi(argv[3]); // global variable
+    int num_threads = atoi(argv[3]); // global variable
+    THREADS_ALIVE_COUNTER = num_threads;
     thrd_t thread[num_threads];
 
     if (strcmp(root_dir, ".") == 0 || strcmp(root_dir, "..") == 0 || opendir(root_dir) == NULL){
@@ -248,7 +254,8 @@ int main(int argc, char **argv) {
             exit(FAIL);
         }
     }
-    mtx_unlock(&start_lock); // the threads will manage to lock start_lock once all the threads are created - this is the signal from main for them to start searching
+    // 4: Signal threads to start searching once all threads were sucessfully created - by allowing them to access start_lock once all the threads are created
+    mtx_unlock(&start_lock);
 
     // --- Wait for threads to finish ------------------
     for (long t = 0; t < num_threads; ++t) {
@@ -256,20 +263,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR in thrd_join(), errno: %s\n", strerror(errno));
             exit(FAIL);
         }
-        printf("Main: completed join with thread %ld having a status of %ld\n", t, (long)status);
+        printf("Main: completed join with thread %ld having a status of %ld\n", t, (long)status); // TODO: remove this printf...
     }
 
-
-    // 4: Signal to send to threads to start ?
-    cnd_wait(&all_threads_ready_signal, &threads_ready_lock); // wait for a thread to signal that all threads are ready
-    cnd_broadcast(&start_signal);
-    
-    // 5: exit program according to specific conditions... 
-
-
-
     // --- Epilogue ------------------------------------
-    printf("Main: program completed. Exiting. Counter = %d\n", counter);
-    thrd_exit(SUCCESS);
+    printf("Done searching, found %d files\n", seach_files_counter);
+
+    if (threads_error == 0) { // there was an error in at least one of the threads
+        return FAIL;
+    }
+
+    return SUCCESS;
 }
 //=================== END OF FILE ====================
