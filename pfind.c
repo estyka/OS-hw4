@@ -6,6 +6,7 @@
 #include <string.h>
 #include <limits.h>
 #include <errno.h>
+#include <linux/limits.h>
 
 
 #define FAIL 1
@@ -56,9 +57,11 @@ typedef struct queue {
 } queue;
 
 void enqueue(queue* _queue, char* _data) {
+	//printf("in enqueue, data=%s\n", _data);
     // initialize new node
     node* new_node = (struct node*) malloc (sizeof(struct node));
-    new_node->data = _data;
+   	new_node->data = (char*) malloc (sizeof(char)*PATH_MAX);
+    strcpy(new_node->data, _data);
 
     // check if queue is empty - if yes add node to front and rear of queue
     if (_queue->front == NULL) {
@@ -74,6 +77,7 @@ void enqueue(queue* _queue, char* _data) {
 }
 
 char* dequeue(queue* _queue) {
+	char* data_to_return = (char*) malloc (sizeof(char)*PATH_MAX);
     // assert that dequeue was called when no empty?
     if (_queue->front == NULL) {
         return NULL; // raise exception?
@@ -89,19 +93,33 @@ char* dequeue(queue* _queue) {
     else { // no need to update rear
         _queue->front = next_node;
     }
-    char* data_to_return = node_to_pop->data;
+    //printf("node_to_pop->data=%s\n", node_to_pop->data);
+    strcpy(data_to_return, node_to_pop->data);
     free(node_to_pop); // no need for this node anymore
 
     return data_to_return;
 }
 
+void test_function(queue* dir_queue) {
+	node* curr_node = dir_queue->front;
+	char* data;
+	int i=0;
+	while (curr_node != NULL) {
+		data = curr_node->data;
+		printf("** node %d data = %s\n", i, data);
+		i++;
+		curr_node = curr_node->next;
+	}
+}
 
 //==================================================== Thread functions
 void handle_dir(char* dir_path_entry) {
+	printf("*** in handle_dir, dir_path_entry=%s\n", dir_path_entry);
     // check if dp_entry can be searched
     DIR* dir_entry_pointer;
-    if ( (dir_entry_pointer=opendir(dir_path_entry)) ) { // enqueue
+    if ( (dir_entry_pointer=opendir(dir_path_entry)) != NULL) { // enqueue
         mtx_lock(&qlock);
+        //printf("about to enqueue:%s \n", dir_path_entry);
         enqueue(dir_queue, dir_path_entry);
         cnd_signal(&notEmpty); // always needs to signal or only when queue was empty before adding?
         mtx_unlock(&qlock);
@@ -118,6 +136,7 @@ void handle_file(char* file_path_entry, char*filename) {
         mtx_lock(&search_files_counter_lock);
         seach_files_counter ++;
         mtx_unlock(&search_files_counter_lock);
+        //printf("***found file:\n");
         printf("%s\n", file_path_entry);
     }
 }
@@ -129,29 +148,32 @@ int search_dir(char* dirname) {
     DIR* dir_pointer;
     struct dirent *entry;
     struct stat stats;
-    char* path_entry;
+    char* path_entry = (char*) malloc (sizeof(char)*PATH_MAX);
 
     dir_pointer = opendir(dirname);
+    //printf("dirname=%s\n", dirname);
     if (dir_pointer == NULL) {
         fprintf(stderr, "ERROR: unable to open dir, errno: %s\n", strerror(errno));
         return FAIL;
     }
     while ( (entry=readdir(dir_pointer)) ) {
+    	//printf("iteration=%d\n", ++i);
         if (strcmp(entry->d_name, ".")==0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
-        path_entry = dirname; // to iterate parent dir to entry
+        strcpy(path_entry, dirname); // to iterate parent dir to entry
         strcat(path_entry, "/");
         strcat(path_entry, entry->d_name);
-        printf("path_entry=%s\n", path_entry);
 
         if (lstat(path_entry, &stats) != 0) { // TODO: not sure if to use stat or lstat?
             fprintf(stderr, "ERROR: unable to get entry stats, errno: %s\n", strerror(errno));
         }
         if (S_ISDIR(stats.st_mode)) {
+        	//printf("isdir: path_entry=%s\n", path_entry);
             handle_dir(path_entry); // check if dir is searchable and if yes add to queue
         }
         else {
+	        //printf("isfile: path_entry=%s\n", path_entry);
             handle_file(path_entry, entry->d_name); // handle folder - check term
         }
     }
@@ -160,6 +182,7 @@ int search_dir(char* dirname) {
         fprintf(stderr, "ERROR: failed to close dir, errno: %s\n", strerror(errno));
         return FAIL;
     }
+    //printf("*** finished search_dir\n");
     return SUCCESS;
 }
 
@@ -172,7 +195,6 @@ void* thread_run(){
     mtx_unlock(&start_lock); // allow other threads to retrieve this lock so they can start searching too
 
     while(1) { // keep trying to dequeue and search until nothing left
-        
         // 2: dequeue
         mtx_lock(&qlock);  // Assumption: dir_queue (==dequeue action) and num_threads_waiting are atomic with qlock
         while (dir_queue->front == NULL ) { // dir queue is empty 
@@ -193,6 +215,7 @@ void* thread_run(){
             num_threads_waiting--; // got woken up so removing itself from waiting list
         }
         char* dirname = dequeue(dir_queue);  // woken up and there is data in dir_queue - time to dequeue
+        //printf("*** in thread_run, dequeued: %s\n", dirname);
         mtx_unlock(&qlock);
         
         // 3: Search dir...
@@ -262,7 +285,7 @@ int main(int argc, char **argv) {
     // 3: Launch threads ------------------------------
     mtx_lock(&start_lock);
     for (long t = 0; t < num_threads; t++) {
-        printf("Main: creating thread %ld\n", t);
+        //printf("Main: creating thread %ld\n", t);
         if (thrd_create(&thread[t], (thrd_start_t) thread_run, NULL) != thrd_success) {
             fprintf(stderr, "ERROR in thrd_create(), errno: %s\n", strerror(errno));
             exit(FAIL);
@@ -277,7 +300,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR in thrd_join(), errno: %s\n", strerror(errno));
             exit(FAIL);
         }
-        printf("Main: completed join with thread %ld having a status of %ld\n", t, (long)status); // TODO: remove this printf...
+        //printf("Main: completed join with thread %ld having a status of %ld\n", t, (long)status); // TODO: remove this printf...
     }
 
     // --- Epilogue ------------------------------------
