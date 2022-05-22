@@ -3,6 +3,7 @@
 #include <thread.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <string.h>
 
 
 #define FAIL 1
@@ -14,11 +15,16 @@
 //============================== Initializations
 queue* dir_queue;
 int num_threads_waiting;
+char* TERM;
+int NUM_THREADS;
+// int thread_at_work;
 
-// locks and cvs
+// locks and cvs - need to initialize
 
 mtx_t qlock; // for accessing num_threads_waiting and dir_queue
 cnd_t notEmpty;
+
+// mtx_t working_thread_lock; // for modifying thread_at_work
 
 //==================================== Queue Implementation - using linked list
 typedef struct node {
@@ -36,12 +42,12 @@ void enqueue(queue* _queue, char* _data) {
     node* new_node = (struct node*) malloc (sizeof(struct node));
     new_node->data = _data;
 
-    // check if queue is empty
+    // check if queue is empty - if yes add node to front and rear of queue
     if (_queue->front == NULL) {
         _queue->front = new_node;
         _queue->rear = new_node;
     }
-    else {
+    else { // else add to front only and update next
         node* current_front = _queue->front;
         _queue->front = new_node;
         new_node->next = current_front;
@@ -71,28 +77,40 @@ node* dequeue(queue* _queue) {
     return data_to_return;
 }
 
-//===================================== Atomic Functions
-
-
-/* … initialization code … */
-
-// void atomic_enqueue(item x) {
-//     pthread_mutex_lock(&qlock);
-//     enqueue(x);
-//     pthread_cond_signal(&notEmpty);
-//     pthread_mutex_unlock(&qlock);
-// }
-
 
 //==================================================== Thread functions
-void search_dir(dirname) {
-    DIR dir_pointer;
+void handle_dir(dir_entry) {
+    // check if 
+    DIR* dir_entry_pointer;
+    if ( (dir_entry_pointer=opendir(dir_entry)) ) { // enqueue
+        mtx_lock(&qlock);
+        enqueue(dir_queue, dir_entry);
+        cnd_signal(&notEmpty); // always needs to signal or only when queue was empty before adding?
+        mtx_unlock(&qlock);
+    }
+    else { // returned NULL - dir_entry can't be searched
+        printf("Directory %s: Permission denied.\n", dir_entry); // TODO: dir_entry needs to be full path!
+    }
+    return;
+}
+
+void handle_folder(folder_entry) {
+    char* ret = strstr(folder_entry, TERM);
+    if (ret != NULL) {
+        printf("%s\n", folder_entry); // TODO: folder_entry needs to be full path
+    }
+}
+
+
+int search_dir(dirname) {
+    DIR* dir_pointer;
     struct dirent *entry;
     struct stat stats;
 
     dir_pointer = opendir(dirname);
     if (dir_pointer == NULL) {
         fprintf(stderr, "ERROR: unable to open dir, errno: %s\n", strerror(errno));
+        return FAIL;
     }
     while ( (entry=readdir(dir_pointer)) ) {
         if (entry->d_name == "." || entry->d_name == "..") {
@@ -102,17 +120,19 @@ void search_dir(dirname) {
             fprintf(stderr, "ERROR: unable to get entry stats, errno: %s\n", strerror(errno));
         }
         if (S_ISDIR(stats.st_mode)) {
-            // handle dir - add to queue...
+            handle_dir(entry); // check if dir is searchable and if yes add to queue
         }
         else {
             // handle folder - check term
+            handle_folder(entry);
         }
-
     }
 
     if (closedir(dir_pointer) != 0) {
         fprintf(stderr, "ERROR: failed to close dir, errno: %s\n", strerror(errno));
+        return FAIL;
     }
+    return SUCCESS;
 }
 
 
@@ -123,23 +143,41 @@ void thread_run(){
     rc = mtx_lock(&start_lock);
     rc = mtx_unlock(&start_lock); // allow other threads to retrieve this lock so they can start searching too
 
-    // 2: dequeue
-    mtx_lock(&qlock);  // Assumption: dir_queue (==dequeue action) and num_threads_waiting are atomic with qlock
-    while (dir_queue->front == NULL ) { // dir queue is empty - need to be woken up when notEmpty.
-        // check if no threads are waiting - dont want to be in cond_wait if there is no more potential work to do
-        if (num_threads_waiting == 0) { // no threads are waiting and nothing to search for - exit cleanly. //TODO: do i need to have a special lock for num_threads_waiting?
-            mtx_unlock(&qlock); //unlock before exiting
-            exit(SUCCESS);
+    while(1) { // keep trying to dequeue and search until nothing left
+        
+        // 2: dequeue
+        mtx_lock(&qlock);  // Assumption: dir_queue (==dequeue action) and num_threads_waiting are atomic with qlock
+        while (dir_queue->front == NULL ) { // dir queue is empty - need to be woken up when notEmpty.
+            // check if no threads are waiting - dont want to be in cond_wait if there is no more potential work to do
+            if (num_threads_waiting == NUM_THREADS && thread_at_work == 0) { // no threads are waiting or working and nothing to search for - exit cleanly. //TODO: do i need to have a special lock for num_threads_waiting?
+                mtx_unlock(&qlock); //unlock before exiting
+                thrd_exit(NULL); // all threads will get to this condition and exit
+                // exit(SUCCESS);
+            }
+            num_threads_waiting++; // before waiting - add myself to waiting list
+            cnd_wait(&notEmpty,&qlock);
+            num_threads_waiting--; // got woken up so removing itself from waiting list
         }
-        num_threads_waiting++; // before waiting - add myself to waiting list
-        cnd_wait(&notEmpty,&qlock);
-        num_threads_waiting--; // remove myself from waiting list. If I want to wait again I'll add myself again in while loop
+        char* dirname = dequeue(dir_queue);  // woken up and there is data in dir_queue - time to dequeue
+        // mtx_lock(&working_thread_lock);
+        // thread_at_work++ ;
+        // mtx_unlock(&working_thread_lock);
+        mtx_unlock(&qlock);
+        
+        // 3: Search dir...
+        int ret = search_dir(dirname);
+        
+        // mtx_lock(&working_thread_lock);
+        // thread_at_work--;
+        // mtx_unlock(&working_thread_lock);
+        
+        if (ret != SUCCESS) {
+            thrd_exit(NULL);
+        }
+         // only when thread finishes processing the info from queue it removes itself from waiting list
+                                // this is so that the queue and waiting list will be empty iff there are no threads working.
     }
-    char* dirname = dequeue(dir_queue);  // woken up and there is data in dir_queue - time to dequeue
-    mtx_unlock(&qlock);
-    
-    // 3: Search dir...
-    search_dir(dirname);
+
 }
 
 
@@ -172,6 +210,9 @@ void thread_run(){
 • argv[3]: number of searching threads to be used for the search (assume a valid integer greater
 than 0)
 */
+
+// TODO: make sure main finished in a case that all threads exited due to an error
+
 int main(int argc, char **argv) {
     int rc;
     int status;
@@ -182,8 +223,8 @@ int main(int argc, char **argv) {
     }
 
     char* root_dir = argv[1]; // TODO: can I assume that this is a dir and not a file? Can I assume that this is not "." or ".."?
-    char* term = argv[2];
-    int num_threads = atoi(argv[3]);
+    TERM = argv[2]; // global variable
+    NUM_THREADS = atoi(argv[3]); // global variable
     thrd_t thread[num_threads];
 
     if (strcmp(root_dir, ".") == 0 || strcmp(root_dir, "..") == 0 || opendir(root_dir) == NULL){
