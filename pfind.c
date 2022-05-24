@@ -29,7 +29,7 @@ int main(int argc, char **argv);
 //============================== Initializations
 queue* dir_queue;
 int num_threads_waiting;
-int threads_error;
+int threads_error = 0;
 char* TERM;
 int threads_alive_counter; // I think qlock is good enough to make this variable atomic - only place it is written to is with qlock locked.
 int seach_files_counter;
@@ -114,10 +114,11 @@ void test_function(queue* dir_queue) {
 
 //==================================================== Thread functions
 void handle_dir(char* dir_path_entry) {
-	printf("*** in handle_dir, dir_path_entry=%s\n", dir_path_entry);
+	// printf("*** in handle_dir, dir_path_entry=%s\n", dir_path_entry);
     // check if dp_entry can be searched
-    DIR* dir_entry_pointer;
-    if ( (dir_entry_pointer=opendir(dir_path_entry)) != NULL) { // enqueue
+    DIR* dir_entry_pointer = opendir(dir_path_entry);
+    //printf("[handle_dir]: dir_path_entry=%s\n" , dir_path_entry);
+    if (dir_entry_pointer != NULL) { // enqueue
         mtx_lock(&qlock);
         //printf("about to enqueue:%s \n", dir_path_entry);
         enqueue(dir_queue, dir_path_entry);
@@ -126,7 +127,9 @@ void handle_dir(char* dir_path_entry) {
     }
     else { // returned NULL - dir_path_entry can't be searched
         printf("Directory %s: Permission denied.\n", dir_path_entry);
+        //fprintf(stderr, "ERROR: unable to open dir, errno: %s\n", strerror(errno));
     }
+    closedir(dir_entry_pointer);
     return;
 }
 
@@ -197,10 +200,12 @@ void* thread_run(){
     while(1) { // keep trying to dequeue and search until nothing left
         // 2: dequeue
         mtx_lock(&qlock);  // Assumption: dir_queue (==dequeue action) and num_threads_waiting are atomic with qlock
+        //printf("***num_threads_waiting=%d, threads_alive_counter=%d\n", num_threads_waiting, threads_alive_counter);
         while (dir_queue->front == NULL ) { // dir queue is empty 
             // check if all other threads are waiting - dont want to be in cond_wait if there is no more potential work to do
             // Assumption: num_threads_waiting == threads_alive_counter-1 iff there are no threads currently working
             if (num_threads_waiting == threads_alive_counter-1) { // TODO: not sure if num_threads_waiting could also be == THREADS_ALIVE_COUNTER
+            	//printf("*** inside condition: num_threads_waiting == threads_alive_counter-1\n");
                 mtx_lock(&threads_counter_lock);
                 threads_alive_counter--;
                 mtx_unlock(&threads_counter_lock);
@@ -240,6 +245,7 @@ void* thread_run(){
 
             thrd_exit(FAIL);
         }
+        //thrd_exit(SUCCESS);
     }
 
 }
@@ -304,12 +310,13 @@ int main(int argc, char **argv) {
     }
 
     // --- Epilogue ------------------------------------
-    printf("Done searching, found %d files\n", seach_files_counter);
-
-    if (threads_error == 0) { // there was an error in at least one of the threads
+	printf("Done searching, found %d files\n", seach_files_counter);
+	
+    if (threads_error != 0) { // there was an error in at least one of the threads
+    	//printf("***[main]: threads_error == 0 - therefore returning non zero value\n");
+    	
         return FAIL;
     }
-
     return SUCCESS;
 }
 //=================== END OF FILE ====================
