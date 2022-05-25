@@ -13,8 +13,6 @@
 #define FAIL 1
 #define SUCCESS 0
 
-// TODO: need to validate all mutex functions (init, lock, unlock)
-// TODO: add path array to dir_queue with max_length - to be able to add dirname, but hold absolute path
 typedef struct node node;
 typedef struct queue queue;
 int enqueue(queue* _queue, char* _data);
@@ -26,7 +24,6 @@ void* thread_run();
 int main(int argc, char **argv);
 
 
-
 //============================== Variable declarations
 queue* dir_queue;
 atomic_int threads_waiting_counter;
@@ -36,17 +33,10 @@ atomic_int search_files_counter;
 atomic_int threads_error = 0;
 char* TERM;
 
-// TODO: locks and cvs - need to initialize
-
 mtx_t qlock; // for accessing num_threads_waiting and dir_queue
 mtx_t start_lock;
 mtx_t print_lock;
 cnd_t notEmpty;
-
-//mtx_t threads_counter_lock; // for accessing threads_error, threads_alive_counter
-//mtx_t search_files_counter_lock;
-
-// mtx_t working_thread_lock; // for modifying thread_at_work
 
 // ========================= Debugger functions
 #include <stdarg.h>
@@ -78,7 +68,6 @@ void debugPrintf(char *fmt, ...) {
     free(placeholder);
     va_end(args);
 }
-// =========================================
 
 //==================================== Queue Implementation - using linked list
 typedef struct node {
@@ -96,23 +85,19 @@ int enqueue(queue* _queue, char* _data) {
     node* new_node = (struct node*) malloc (sizeof(struct node));
     
     
-    if (new_node == NULL) {
-	    debugPrintf("[enqueue]: failed to allocate space for new node or for data of new node\n");
+    if (new_node == NULL) { // allocation failure
+    	fprintf(stderr, "ERROR: memory allocation failed\n");
     	return FAIL;	
     }
     
     new_node->data = (char*) malloc (PATH_MAX * sizeof(char));
     
-    if (new_node->data == NULL) {
-	    debugPrintf("[enqueue]: failed to allocate space for data of new node\n");
+    if (new_node->data == NULL) { // allocation failure
+	    fprintf(stderr, "ERROR: memory allocation failed\n");
     	return FAIL;	
     }
     
     strcpy(new_node->data, _data);
-    
-    if (_data == NULL || strlen(_data) == 0 || strcmp(new_node->data, _data) != 0 ) {
-    	debugPrintf("[enqueue]: WARNING: new_node->data=%s, _data=%s\n", new_node->data, _data);
-    }
 	
 	new_node->next = _queue->front;
 	_queue->front = new_node;
@@ -130,9 +115,6 @@ char* dequeue(queue* _queue) {
 
     node* node_to_pop = _queue->front;
     data_from_node = node_to_pop->data;
-    if (data_from_node == NULL) {
-    	debugPrintf("WARNING: [dequeue]: data_from_node=%s\n", data_from_node);
-    }
   	
     _queue->front = node_to_pop->next;
 	
@@ -141,24 +123,10 @@ char* dequeue(queue* _queue) {
     }
     free(node_to_pop); // no need for this node anymore
     strcpy(data_to_return, data_from_node);
-    debugPrintf("[dequeue]: copied data_from_node=%s to data_to_return=%s\n", data_from_node, data_to_return);
-    
 
     return data_to_return;
 }
 
-
-void test_function(queue* dir_queue) {
-	node* curr_node = dir_queue->front;
-	char* data;
-	int i=0;
-	while (curr_node != NULL) {
-		data = curr_node->data;
-		printf("** node %d data = %s\n", i, data);
-		i++;
-		curr_node = curr_node->next;
-	}
-}
 
 //==================================================== Thread functions
 int handle_dir(char* dir_path_entry) {
@@ -247,75 +215,45 @@ void* thread_run(){
     while(1) { // 2: keep trying to dequeue and search until nothing left
         mtx_lock(&qlock);  // Assumption: dir_queue (==dequeue action) and num_threads_waiting are atomic with qlock
         
-        //debugPrintf("[thread_run]: locked qlock\n");
-        //debugPrintf("[thread_run]: threads_waiting_counter=%d, threads_alive_counter=%d\n", threads_waiting_counter, threads_alive_counter);
-       
         while (dir_queue->front == NULL ) { // dir queue is empty 
             // check if all other threads are waiting - dont want to be in cond_wait if there is no more potential work to do
             // Assumption: num_threads_waiting == threads_alive_counter-1 iff there are no threads currently working
-            if (threads_waiting_counter == threads_alive_counter-1) { // TODO: not sure if num_threads_waiting could also be == THREADS_ALIVE_COUNTER (then need <=)
-            	//debugPrintf("[thread_run]: threads_waiting_counter=%d == threads_alive_counter-1=%d\n", threads_waiting_counter, threads_alive_counter-1);
-                //mtx_lock(&threads_counter_lock);
+            if (threads_waiting_counter == threads_alive_counter-1) { 
                 threads_alive_counter--;
-                //debugPrintf("[thread_run]: updating threads_alive_counter to be = %d\n", threads_alive_counter);
-                //mtx_unlock(&threads_counter_lock);
-
-                cnd_signal(&notEmpty); // wake up another thread so it can also exit - all threads will eventually be woken up and get to this condition to exit // TODO: not sure if this should be cnd_broadcast?
-                //debugPrintf("[thread_run]: sent cnd_signal(&notEmpty)\n");
+                
+                cnd_signal(&notEmpty); // wake up another thread so it can also exit - all threads will eventually be woken up and get to this condition to exit
                 mtx_unlock(&qlock); //unlock before exiting
-				//debugPrintf("[thread_run]: unlocked qlock and exiting\n");
                 thrd_exit(SUCCESS); // all threads will get to this condition and exit
             }
             threads_waiting_counter++; // before waiting - add myself to waiting list
-            //debugPrintf("[thread_run]: updating threads_waiting_counter=%d\n", threads_waiting_counter);
             cnd_wait(&notEmpty,&qlock); // need to be woken up when notEmpty.
-            //debugPrintf("[thread_run]: woke up from cnd_wait with qlock\n");
             threads_waiting_counter--; // got woken up so removing itself from waiting list
-            //debugPrintf("[thread_run]: updating threads_waiting_counter=%d, about to check while loop cond again: dir_queue->front == NULL \n", threads_waiting_counter);
         }
-        //debugPrintf("[thread_run]: about to dequeue\n");
         dirname = dequeue(dir_queue);  // woken up and there is data in dir_queue - time to dequeue
-	    //debugPrintf("[thread_run]: dequeued dirname=%s\n", dirname);
-
-        running_threads_counter++;
-        //debugPrintf("[thread_run]: updating running_threads_counter=%d\n", running_threads_counter);
-        
+        running_threads_counter++;        
         mtx_unlock(&qlock);
-        //debugPrintf("[thread_run]: unlocked qlock\n");
-        
         
         // 3: Search dir...
         ret = search_dir(dirname);
         running_threads_counter--;
-        //debugPrintf("[thread_run]: returned from searching dir, updating running_threads_counter=%d\n", running_threads_counter);
         
         if (ret != SUCCESS) {
-	        debugPrintf("[thread_run]: ret != SUCCESS\n");
 
             threads_alive_counter--;
             running_threads_counter--;
             threads_error = 1;
-            //debugPrintf("[thread_run]: updating threads_alive_counter=%d, running_threads_counter=%d, threads_error=%d\n", threads_alive_counter, running_threads_counter, threads_error);
 
             mtx_lock(&qlock);
-            //debugPrintf("[thread_run]: locked qlock\n");
             
             if (dir_queue->front != NULL) { // if queue is not empty - wake up another thread to start searching
-	            //debugPrintf("[thread_run]: dir_queue->front != NULL - going to send cnd_signal(&notEmpty)\n");
                 cnd_signal(&notEmpty);
-                //debugPrintf("[thread_run]: sent cnd_signal(&notEmpty)\n");
             }
             else if (threads_waiting_counter==threads_alive_counter-1) { // if no more potential work - wake up another thread to exit
-	            //debugPrintf("[thread_run]: threads_waiting_counter==threads_alive_counter-1 - going to send cnd_signal(&notEmpty)\n");
-	            //debugPrintf("[thread_run]: threads_alive_counter=%d, running_threads_counter=%d, threads_error=%d\n", threads_alive_counter, running_threads_counter, threads_error);
                 cnd_signal(&notEmpty); 
-                //debugPrintf("[thread_run]: sent cnd_signal(&notEmpty)\n");
             }
             // else - if queue is empty but not all threads are waiting - it means that there are other threads working who can wake up other threads - TODO: make sure this is a correct assumption
 
             mtx_unlock(&qlock);
-            //debugPrintf("[thread_run]: unlocked qlock, about to exit with fail\n");
-
             thrd_exit(FAIL);
         }
     }
@@ -328,17 +266,13 @@ void initialize_locks_and_cvs() {
     mtx_init(&qlock, mtx_plain);
     mtx_init(&start_lock, mtx_plain);
     mtx_init(&print_lock, mtx_plain);
-    //mtx_init(&threads_counter_lock, mtx_plain);
-    //mtx_init(&search_files_counter_lock, mtx_plain);
     cnd_init(&notEmpty);
 }
 
 void destroy_locks_and_cvs() {
     mtx_destroy(&qlock);
     mtx_destroy(&start_lock);
-    mtx_destroy(&print_lock); // to delete
-    //mtx_destroy(&threads_counter_lock);
-    //mtx_destroy(&search_files_counter_lock);
+    mtx_destroy(&print_lock);
     cnd_destroy(&notEmpty);
 }
 
@@ -362,7 +296,7 @@ int main(int argc, char **argv) {
         exit(FAIL);
     }
 
-    char* root_dir = argv[1]; // TODO: can I assume that this is a dir and not a file? Can I assume that this is not "." or ".."?
+    char* root_dir = argv[1]; // TODO: can I assume that this is a dir and not a file?
     TERM = argv[2]; // global variable
     int num_threads = atoi(argv[3]); // global variable
     threads_alive_counter = num_threads;
@@ -395,7 +329,6 @@ int main(int argc, char **argv) {
     }
     // 4: Signal threads to start searching once all threads were sucessfully created - by allowing them to access start_lock once all the threads are created
     mtx_unlock(&start_lock);
-    debugPrintf("[main]: #### threads should not start before this message!\n");
 
     // --- Wait for threads to finish ------------------
     for (long t = 0; t < num_threads; ++t) {
@@ -403,10 +336,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR in thrd_join(), errno: %s\n", strerror(errno));
             exit(FAIL);
         }
-//        debugPrintf("[main]: thrd_join returned for thread id=%d\n", thread[t]);
         //printf("Main: completed join with thread %ld having a status of %ld\n", t, (long)status); // TODO: remove this printf...
     }
-    debugPrintf("[main]: meant to get here only when all threads are finished running!!!!\n");
 
     // --- Epilogue ------------------------------------
     mtx_lock(&print_lock);
@@ -417,7 +348,6 @@ int main(int argc, char **argv) {
 	//free_queue();
 	
     if (threads_error != 0) { // there was an error in at least one of the threads
-        debugPrintf("[main]: threads_error != 0 !!!\n");
         return FAIL;
     }
     return SUCCESS;
