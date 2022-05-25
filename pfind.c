@@ -38,36 +38,6 @@ mtx_t start_lock;
 mtx_t print_lock;
 cnd_t notEmpty;
 
-// ========================= Debugger functions
-#include <stdarg.h>
-#include <stdint.h>
-
-long getNanoTs(void) {
-    struct timespec spec;
-    clock_gettime(CLOCK_REALTIME, &spec);
-    return (int64_t) (spec.tv_sec) * (int64_t) 1000000000 + (int64_t) (spec.tv_nsec);
-}
-
-char *debugFormat = "[%02x] : %lu : %d : ";
-char *debugLevel = "***";
-
-
-void debugPrintf(char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    char *placeholder = malloc(strlen(debugFormat) + strlen(debugLevel) + 1);
-    char *newFmt = malloc(strlen(debugLevel) + strlen(fmt) + 1);
-    snprintf(placeholder, strlen(debugFormat) + strlen(debugLevel) + 1, "%s%s", debugLevel, debugFormat);
-    snprintf(newFmt, strlen(debugLevel) + strlen(fmt) + 1, "%s%s", debugLevel, fmt);
-    mtx_lock(&print_lock);
-    printf(placeholder, thrd_current(), getNanoTs(), running_threads_counter);
-    vprintf(newFmt, args);
-    mtx_unlock(&print_lock);
-    fflush(stdout);
-    free(newFmt);
-    free(placeholder);
-    va_end(args);
-}
 
 //==================================== Queue Implementation - using linked list
 typedef struct node {
