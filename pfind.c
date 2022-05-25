@@ -26,15 +26,15 @@ int main(int argc, char **argv);
 
 
 
-//============================== Initializations
+//============================== Variable declarations
 queue* dir_queue;
 int num_threads_waiting;
 int threads_error = 0;
 char* TERM;
-int threads_alive_counter; // I think qlock is good enough to make this variable atomic - only place it is written to is with qlock locked.
+atomic_int threads_alive_counter; // I think qlock is good enough to make this variable atomic - only place it is written to is with qlock locked.
 int seach_files_counter;
 
-// locks and cvs - need to initialize
+// TODO: locks and cvs - need to initialize
 
 mtx_t qlock; // for accessing num_threads_waiting and dir_queue
 mtx_t start_lock;
@@ -44,6 +44,37 @@ mtx_t threads_counter_lock; // for accessing threads_error, threads_alive_counte
 mtx_t search_files_counter_lock;
 
 // mtx_t working_thread_lock; // for modifying thread_at_work
+
+// ========================= Debugger functions
+#include <stdarg.h>
+#include <stdint.h>
+
+long getNanoTs(void) {
+    struct timespec spec;
+    clock_gettime(CLOCK_REALTIME, &spec);
+    return (int64_t) (spec.tv_sec) * (int64_t) 1000000000 + (int64_t) (spec.tv_nsec);
+}
+
+char *debugFormat = "[%02x] : %lu : %d : ";
+char *debugLevel = "***";
+
+void debugPrintf(char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char *placeholder = malloc(strlen(debugFormat) + strlen(debugLevel) + 1);
+    char *newFmt = malloc(strlen(debugLevel) + strlen(fmt) + 1);
+    snprintf(placeholder, strlen(debugFormat) + strlen(debugLevel) + 1, "%s%s", debugLevel, debugFormat);
+    snprintf(newFmt, strlen(debugLevel) + strlen(fmt) + 1, "%s%s", debugLevel, fmt);
+    pthread_mutex_lock(&printLock);
+    printf(placeholder, pthread_self(), getNanoTs(), runningThreads);
+    vprintf(newFmt, args);
+    pthread_mutex_unlock(&printLock);
+    fflush(stdout);
+    free(newFmt);
+    free(placeholder);
+    va_end(args);
+}
+// =========================================
 
 //==================================== Queue Implementation - using linked list
 typedef struct node {
@@ -195,7 +226,9 @@ void* thread_run(){
 
     // 1: signal from main that all threads are created and ready to start searching == start_lock is available
     mtx_lock(&start_lock);
+    debugPrintf("[thread_run]: locking start_lock\n");
     mtx_unlock(&start_lock); // allow other threads to retrieve this lock so they can start searching too
+    debugPrintf("[thread_run]: finished locking and unlocking start_lock\n");
 
     while(1) { // keep trying to dequeue and search until nothing left
         // 2: dequeue
@@ -252,6 +285,23 @@ void* thread_run(){
 
 
 //==================================================== Main Functions
+void initialize_locks_and_cvs() {
+    mtx_init(&qlock, mtx_plain);
+    mtx_init(&start_lock, mtx_plain);
+    mtx_init(&threads_counter_lock, mtx_plain);
+    mtx_init(&search_files_counter_lock, mtx_plain);
+    cnd_init(&notEmpty);
+}
+
+void destroy_locks_and_cvs() {
+    mtx_destroy(&qlock);
+    mtx_destroy(&start_lock);
+    mtx_destroy(&threads_counter_lock);
+    mtx_destroy(&search_files_counter_lock);
+    cnd_destroy(&notEmpty);
+}
+
+
 /*
 • argv[1]: search root directory (search for files within this directory and its subdirectories).
 • argv[2]: search term (search for file names that include the search term).
@@ -282,7 +332,9 @@ int main(int argc, char **argv) {
     }
 
     //--- Starting Flow ------------------------------
-    // 1: initialize queue
+    // 1: initializations
+    initialize_locks_and_cvs();
+
     dir_queue = (struct queue*) malloc (sizeof(struct queue));
 
     // 2: add root_dir to queue
@@ -311,10 +363,10 @@ int main(int argc, char **argv) {
 
     // --- Epilogue ------------------------------------
 	printf("Done searching, found %d files\n", seach_files_counter);
-	
+	destroy_locks_and_cvs();
     if (threads_error != 0) { // there was an error in at least one of the threads
     	//printf("***[main]: threads_error == 0 - therefore returning non zero value\n");
-    	
+        	
         return FAIL;
     }
     return SUCCESS;
